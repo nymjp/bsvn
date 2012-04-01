@@ -1,0 +1,280 @@
+#!/usr/bin/perl
+#
+# bsvn - svn branch operation helper
+#
+# LICENSE AND COPYRIGHT
+#
+# Copyright (C) 2011 YAMAMOTO, N
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of either: the GNU General Public License as published
+# by the Free Software Foundation; or the Artistic License.
+#
+# See http://dev.perl.org/licenses/ for more information.
+
+use strict;
+use warnings;
+use Pod::Usage;
+use Cwd qw(cwd abs_path);
+use FindBin;
+use File::Spec::Functions qw(:ALL);
+use Getopt::Long qw(:config no_permute);
+
+our $SVN             = 'svn';
+our $BSVN_DIR        = catfile( '.svn', 'bsvn' );
+our $BSVN_CONFIG     = catfile( $BSVN_DIR, 'config' );
+our $BSVN_LASTARGS   = catfile( $BSVN_DIR, 'lastargs' );
+our %CONFIG_TEMPLATE = (
+    root_url     => undef,
+    root_pattern => '^\@',
+);
+our $DEFAULT_EDITOR = 'vi';
+
+our ($DEBUG);
+
+##
+## special handlers
+##
+sub usage {
+    pod2usage(
+        -exitval => 1,
+        -verbose => 2,
+    );
+}
+
+sub init {
+    my ( undef, $url ) = @_;
+    $url =~ s!/$!!;
+    $CONFIG_TEMPLATE{root_url} = $url;
+
+    require Data::Dumper;
+    mkdir $BSVN_DIR;
+    open my $fh, '>', $BSVN_CONFIG or die $!;
+    print $fh Data::Dumper::Dumper( \%CONFIG_TEMPLATE );
+    exit 0;
+}
+
+sub edit {
+    my ( undef, $file ) = @_;
+
+    if ( -f $BSVN_LASTARGS ) {
+        open my $fh, '+<', $file or die $!;
+        my @lines = <$fh>;
+        for (@lines) {
+            if (/^--/) {
+                $_ .= "last branch operation:\n"
+                    . load_lastargs($BSVN_LASTARGS);
+                last;
+            }
+        }
+        seek $fh, 0, 0;
+        print $fh join '', @lines;
+    }
+
+    my $editor
+        = (    $ENV{BSVN_EDITOR}
+            || $ENV{VISUAL}
+            || $ENV{EDITOR}
+            || $DEFAULT_EDITOR );
+    exec $editor, $file;
+}
+
+##
+## helper functions
+##
+
+sub run_svn {
+    my ( $dir, @args ) = @_;
+
+    use Errno qw(EAGAIN);
+FORK: {
+        my $pid = fork;
+        if ($pid) {
+            wait();
+            return $?;
+        }
+        elsif ( defined $pid ) {
+            chdir $dir;
+            exec $SVN, @args or exit 2;
+        }
+        elsif ( $! == EAGAIN ) {
+            redo FORK;
+        }
+        else {
+            return -1;
+        }
+    }
+}
+
+sub svn_info {
+    my ($path) = @_;
+    local $ENV{LC_MESSAGES} = 'C';
+    local $ENV{LC_CTYPE}    = 'C';
+
+    open my $svn, '-|', $SVN, 'info', $path or die $!;
+    my ( %info, @key );
+    while (<$svn>) {
+        if (/^([^:]+):\s+(.*)$/) {
+            push @key, $1;
+            $info{$1} = $2;
+        }
+    }
+    $info{_key_} = \@key;
+    \%info;
+}
+
+sub load_config {
+    my ($top_path) = @_;
+    my $file = catfile( $top_path, $BSVN_CONFIG );
+    my $config = do "$file" or die $!;
+    $config->{root_pattern} = qr($config->{root_pattern});
+
+    $config;
+}
+
+sub find_top_path {
+    my @top_path = splitdir(cwd);
+    my @rel_path;
+    while (@top_path) {
+        last if -d catfile( @top_path, $BSVN_DIR );
+        unshift @rel_path, pop @top_path;
+    }
+    die "bsvn directory($BSVN_DIR) not found.\n" unless @top_path;
+
+    return ( catfile(@top_path), catfile(@rel_path) );
+}
+
+sub find_branch_path {
+    my ( $svn_info, $root_url ) = @_;
+    my $url = $svn_info->{URL};
+
+    die "branch url not found." unless defined $url;
+    die "root url not found." unless ( $url =~ m!^\Q$root_url\E/(.*)$! );
+    $1;
+}
+
+sub expand_args {
+    my ( $config, $info ) = @_;
+    my $root_ptn = qr($config->{root_pattern});
+
+    my $is_branch_expanded;
+    for (@ARGV) {
+        my $is_branch;
+        if (s!$root_ptn[.]!$info->{root_url}/$info->{branch_path}!o) {
+            $is_branch = 1;
+        }
+        elsif (s!$root_ptn!$info->{root_url}/!o) {
+            $is_branch = 1;
+        }
+        elsif ( defined $info->{rel_path} && -e $_ ) {
+            $_ = catfile( $info->{rel_path}, $_ );
+        }
+
+        $is_branch && s{^\Q$info->{svn}{'Repository Root'}\E}{^};
+        $is_branch && s{(?<=@)(BASE|COMMITTED|PREV)$}{
+            my $rev = $1;
+            if ( $rev eq 'BASE' ) {
+                $info->{svn}{Revision};
+            }
+            elsif ( $rev eq 'COMMITTED' ) {
+                $info->{svn}{'Last Changed Rev'};
+            }
+            elsif ( $rev eq 'PREV' ) {
+                $info->{svn}{'Last Changed Rev'} - 1;
+            }
+            else {
+                $rev
+            }
+        }e;
+        $is_branch_expanded ||= $is_branch;
+    }
+    $is_branch_expanded;
+}
+
+sub save_lastargs {
+    my ( $info, @args ) = @_;
+    if ( open my $fh, '>', catfile( $info->{top_path}, $BSVN_LASTARGS ) ) {
+        print $fh "@args\n";
+    }
+}
+
+sub load_lastargs {
+    my $last_args = '';
+    if ( open my $fh, '<', $BSVN_LASTARGS ) {
+        $last_args = join '', <$fh>;
+    }
+    $last_args;
+}
+
+##
+## main
+##
+
+MAIN: {
+    GetOptions(
+        'help|h' => \&usage,
+        'init=s' => \&init,
+        'edit=s' => \&edit,
+        'debug'  => \$DEBUG,
+    ) or die;
+    usage unless (@ARGV);
+
+    my ( $top_path, $rel_path ) = find_top_path();
+    my $config = load_config($top_path);
+
+    my $svn_info = svn_info($top_path);
+    my $branch_path = find_branch_path( $svn_info, $config->{root_url} );
+
+    my $info = {
+        svn         => $svn_info,
+        root_url    => $config->{root_url},
+        top_path    => $top_path,
+        branch_path => $branch_path,
+        rel_path    => $rel_path,
+    };
+
+    my $is_branch_expanded = expand_args( $config, $info );
+
+    # run svn
+    if ($DEBUG) {
+        warn "cmd: $SVN @ARGV\n";
+    }
+    else {
+        save_lastargs( $info, @ARGV ) if $is_branch_expanded;
+        local $ENV{BSVN_EDITOR} = $ENV{SVN_EDITOR};
+        local $ENV{SVN_EDITOR}
+            = abs_path( catfile( $FindBin::Bin, $FindBin::Script ) )
+            . " --edit";
+        run_svn( $top_path, @ARGV ) and exit( $? >> 8 );
+    }
+}
+
+__END__
+
+=head1 NAME
+
+bsvn
+
+=head1 SYNOPSIS
+
+ bsvn --init MODULE_TOP_URL
+ bsvn SVN_ARGS...
+
+When I<SVN_ARGS> have an argument '@I<BRANCH>',
+it will be expanded to 'I<MODULE_TOP_URL>/I<BRANCH>'.
+
+=head1 OPTIONS
+
+=over 4
+
+=item --init MODULE_TOP_URL
+
+=back
+
+initialize working copy for bsvn.
+
+=head1 SEE ALSO
+
+See https://github.com/nymjp/bsvn for more information.
+
+=cut
